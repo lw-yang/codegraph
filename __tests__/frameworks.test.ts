@@ -613,6 +613,27 @@ let app = Router::new()
     expect(nodes[0].name).toBe('GET /articles/feed');
     expect(references[0].referenceName).toBe('feed_articles');
   });
+
+  it('extracts actix web::resource().route(web::METHOD().to(handler))', () => {
+    const src = `App::new().service(web::resource("/user/{id}").route(web::get().to(get_user)))\n`;
+    const { nodes, references } = rustResolver.extract!('main.rs', src);
+    expect(nodes[0].name).toBe('GET /user/{id}');
+    expect(references[0].referenceName).toBe('get_user');
+  });
+
+  it('extracts actix web::resource("/").to(handler) (all methods)', () => {
+    const src = `App::new().service(web::resource("/").to(index))\n`;
+    const { nodes, references } = rustResolver.extract!('main.rs', src);
+    expect(nodes[0].name).toBe('ANY /');
+    expect(references[0].referenceName).toBe('index');
+  });
+
+  it('extracts actix App-level .route("/path", web::METHOD().to(handler))', () => {
+    const src = `App::new().route("/health", web::get().to(health_check))\n`;
+    const { nodes, references } = rustResolver.extract!('main.rs', src);
+    expect(nodes[0].name).toBe('GET /health');
+    expect(references[0].referenceName).toBe('health_check');
+  });
 });
 
 describe('rustResolver.resolve cargo workspace crates', () => {

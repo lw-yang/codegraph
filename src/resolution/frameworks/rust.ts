@@ -187,6 +187,70 @@ export const rustResolver: FrameworkResolver = {
       }
     }
 
+    // Actix-web builder API (the dominant actix routing style; attribute macros
+    // are handled above). The handler lives in `.to(handler)`, not `get(handler)`.
+    const pushActixRoute = (routePath: string, method: string, handlerExpr: string, line: number) => {
+      const handler = handlerExpr.split('::').filter(Boolean).pop();
+      if (!handler) return;
+      const upper = method.toUpperCase();
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${upper}:${routePath}`,
+        kind: 'route',
+        name: `${upper} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 0,
+        language: 'rust',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: handler,
+        referenceKind: 'references',
+        line,
+        column: 0,
+        filePath,
+        language: 'rust',
+      });
+    };
+
+    // web::resource("/path") { .route(web::METHOD().to(h)) | .to(h) } — possibly chained.
+    const resourceRegex = /web::resource\s*\(\s*"([^"]+)"\s*\)/g;
+    while ((match = resourceRegex.exec(safe)) !== null) {
+      const routePath = match[1]!;
+      const startLine = safe.slice(0, match.index).split('\n').length;
+      const after = match.index + match[0].length;
+      // Bound the resource's method chain at the next resource() to avoid bleed.
+      const nextRes = safe.indexOf('web::resource', after);
+      const end = Math.min(after + 500, nextRes === -1 ? safe.length : nextRes);
+      const chain = safe.slice(after, end);
+
+      const methodTo = /web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
+      let m2: RegExpExecArray | null;
+      let found = false;
+      while ((m2 = methodTo.exec(chain)) !== null) {
+        const mLine = startLine + chain.slice(0, m2.index).split('\n').length - 1;
+        pushActixRoute(routePath, m2[1]!, m2[2]!, mLine);
+        found = true;
+      }
+      // Direct `.resource("/x").to(handler)` (all methods) when no explicit verb route.
+      if (!found) {
+        const direct = chain.match(/^\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/);
+        if (direct) pushActixRoute(routePath, 'ANY', direct[1]!, startLine);
+      }
+    }
+
+    // App-level: .route("/path", web::METHOD().to(handler)).
+    const appRouteRegex = /\.route\s*\(\s*"([^"]+)"\s*,\s*web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
+    while ((match = appRouteRegex.exec(safe)) !== null) {
+      const line = safe.slice(0, match.index).split('\n').length;
+      pushActixRoute(match[1]!, match[2]!, match[3]!, line);
+    }
+
     return { nodes, references };
   },
 };
