@@ -175,7 +175,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 |---|---|---|---|---|
 | TypeScript/JS | React / observer / EventEmitter | state→render; dispatch→callback | S + X | ✅ (excalidraw) |
 | TypeScript/JS | Vue / Nuxt | template events (@click→handler); component composition; reactive→render | S + X | ✅ events + composition (vitepress S / vben M / element-plus L); 🔬 reactive→render (vue-core Proxy runtime — frontier, deferred) |
-| TypeScript/JS | Svelte / SvelteKit | store → DOM update | ? | ⬜ |
+| TypeScript/JS | Svelte / SvelteKit | template calls/composition; SvelteKit action→api; store→DOM | X | ✅ already strong (realworld S / skeleton M / shadcn L): template `{fn()}` calls, `<Pascal/>` composition, `import * as api` namespace, `load`→api all work out of the box. + exported-const object-of-functions extraction (SvelteKit `actions`). 🔬 `$lib`-namespace-from-action + store/reactive frontier |
 | TypeScript/JS | Express / Koa | request → middleware → handler | ? | ⬜ |
 | TypeScript/JS | NestJS | request → controller → provider | ? | ⬜ |
 | TypeScript/JS | RxJS / signals | subscribe → operator → observer | S | ⬜ |
@@ -220,6 +220,19 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   **prefix-convention kebab** — element-plus `el-button` → `button.vue` (component named
   `button`, not `ElButton`), so kebab stays unresolved there; and **reactive→render**
   (vue-core Proxy runtime) — the deep framework-internal frontier, deferred.
+- **Svelte / SvelteKit (validated 2026-05-23, realworld S / skeleton M / shadcn L) — already well-covered.**
+  Unlike Vue, the `.svelte` extractor already parses the template: `extractTemplateCalls` (`{fn()}`),
+  `extractTemplateComponents` (`<Pascal/>` composition — skeleton 956 / shadcn 1610 reference edges),
+  plus `import * as api` namespace + `load`→api resolution all work. Agent A/B (realworld login): with
+  codegraph **1 read** vs without **4** — codegraph already wins out of the box. The one extraction gap
+  was **object-of-functions** (`export const actions = { default: async () => {} }`; the walker
+  deliberately skips object-literal functions to avoid inline-object noise). Fixed for EXPORTED consts
+  (general — Redux/Express handler maps too); `extractFunction` `nameOverride` keeps inline-object arrows
+  skipped. **Residual:** a `$lib`-alias namespace call (`api.post`) from an extracted action node doesn't
+  resolve even though the same alias resolves for `load` — a deeper resolver interaction, deferred
+  (local/relative calls from actions connect). **Lesson: measure before assuming a hole** — modern Svelte
+  barely uses `on:click={fn}` (form actions / callback props instead), so the assumed event-handler hole
+  wasn't the real one; Svelte needed far less than Vue.
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
