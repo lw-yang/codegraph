@@ -386,3 +386,32 @@ ships and needs no steering.
 ARM=I bash scripts/agent-eval/arms-F.sh    # body-trace + destination callees, no steering
 node scripts/agent-eval/parse-arms.mjs
 ```
+
+---
+
+# Current-build with/without A/B (excalidraw, 2026-05-24)
+
+After this session's changes (self-sufficient trace + explore-flow + line numbers), a fresh
+with-vs-without A/B on excalidraw — same flow question, **n=3 per arm** (headless: codegraph-only MCP
+vs empty MCP):
+
+| metric | with codegraph | without | delta |
+|---|--:|--:|--:|
+| duration | 49s [43–53] | 145s [88–184] | **3.0× faster** |
+| total tool calls | 3.3 [3–4] | 49.3 [20–85] | 15× fewer |
+| Reads | 0.3 [0–1] | 23.3 [9–39] | ~0 vs 23 |
+| Grep/Glob | 0.0 | 14.3 [11–21] | eliminated |
+| codegraph calls | 3.0 | 0 | the trade |
+| tokens in | 120k [105–149] | 181k [78–384] | −34% |
+| tokens out | 5.9k | 8.8k | −33% |
+| **cost** | **$0.405** | **$0.678** | **−40%** |
+
+**Cost is neutral-to-lower, NOT flat** — correcting the earlier "cost stays ~flat" framing. Every one
+of the 3 without-runs cost more than every with-run. Mechanism = caching: compact codegraph answers
+(3 calls) cache well across turns, while the without-arm's 23 reads + 14 greps create fresh,
+poorly-cacheable input that's re-paid each turn. The without-arm also has large tail variance
+(88–184s, 20–85 tools, up to 384k tokens) that codegraph removes. n=3 — the direction is unambiguous
+(with beat without on every metric in every pair); treat magnitudes as a range.
+
+Reproduce: `AGENT_EVAL_OUT=<dir> scripts/agent-eval/run-all.sh <repo> "<Q>" headless` per run;
+`scripts/agent-eval/parse-run.mjs <jsonl>` for per-run reads/tools/tokens/cost.
