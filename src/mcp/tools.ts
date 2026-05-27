@@ -1083,7 +1083,18 @@ export class ToolHandler {
     }
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const maxNodes = (args.maxNodes as number) || 20;
+    // On tiny repos (<150 files), trim maxNodes hard — the entire repo
+    // is grep-able in a turn so a 20-node context is wasted budget.
+    // 8 covers the typical 1-3 entry-point + their immediate neighbors
+    // without dragging in the rest of the small codebase.
+    let defaultMaxNodes = 20;
+    try {
+      const stats = cg.getStats();
+      if (stats.fileCount < 150) defaultMaxNodes = 8;
+    } catch {
+      // stats failure — fall back to the standard default
+    }
+    const maxNodes = (args.maxNodes as number) || defaultMaxNodes;
     const includeCode = args.includeCode !== false;
 
     const context = await cg.buildContext(task, {
