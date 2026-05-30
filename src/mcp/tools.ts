@@ -2164,9 +2164,42 @@ export class ToolHandler {
       }
     }
 
+    // Named-symbol seeding: findRelevantContext is an FTS/text rank, so a query
+    // that's a BAG of symbol names skewed toward one phase (Alamofire: 5 build
+    // terms, each a high-frequency name, vs 3 validate terms) lets the
+    // lower-frequency names fall below the search cut — their definitions, and
+    // whole files (Validation.swift), never get gathered, so they can never
+    // render and the agent Reads them. Resolve EACH named token to its
+    // substantive definition (skip empty stubs + test files, same relevance the
+    // trace endpoint picker uses) and inject it as an entry, so every symbol the
+    // agent explicitly named is in the subgraph and its file is scored.
+    const namedSeedIds = new Set<string>();
+    {
+      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte)$/i;
+      const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+      const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
+      const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
+      const tokens = [...new Set(
+        query.split(/[\s,()[\]]+/)
+          .map((t) => t.replace(FILE_EXT, '').trim())
+          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+      )].slice(0, 16);
+      for (const t of tokens) {
+        const cands = this.findAllSymbols(cg, t).nodes
+          .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+          .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
+        // A specific name (<=3 defs) injects all its defs; an overloaded name
+        // (`request` = 44, mostly stubs) injects only the single most substantive
+        // one, so the build-overload flood doesn't crowd the subgraph.
+        for (const n of cands.slice(0, cands.length <= 3 ? cands.length : 1)) {
+          if (!subgraph.nodes.has(n.id)) { subgraph.nodes.set(n.id, n); namedSeedIds.add(n.id); }
+        }
+      }
+    }
+
     // Step 2: Group nodes by file, score by relevance
     const fileGroups = new Map<string, { nodes: Node[]; score: number }>();
-    const entryNodeIds = new Set(subgraph.roots);
+    const entryNodeIds = new Set([...subgraph.roots, ...namedSeedIds]);
 
     // Build a set of nodes directly connected to entry points (depth 1)
     const connectedToEntry = new Set<string>();
@@ -2181,8 +2214,15 @@ export class ToolHandler {
 
       const group = fileGroups.get(node.filePath) || { nodes: [], score: 0 };
       group.nodes.push(node);
-      // Score: entry point nodes worth 10, directly connected worth 3, others worth 1
-      if (entryNodeIds.has(node.id)) {
+      // Score: a NAMED-SEED node (a symbol the agent named that FTS missed, now
+      // injected) is worth far more than a mere reference — its file is where the
+      // answer lives. Without this, an incidental file that name-drops the flow
+      // (Combine.swift references request/task → score 23 from connected nodes)
+      // outranks the file that DEFINES a named symbol (Validation.swift's
+      // `validate` → 10) and steals its render slot. Definition ≫ reference.
+      if (namedSeedIds.has(node.id)) {
+        group.score += 50;
+      } else if (entryNodeIds.has(node.id)) {
         group.score += 10;
       } else if (connectedToEntry.has(node.id)) {
         group.score += 3;
@@ -2383,7 +2423,15 @@ export class ToolHandler {
 
     for (const [filePath, group] of sortedFiles) {
       if (filesIncluded >= maxFiles) break;
-      if (totalChars > budget.maxOutputChars * 0.9) break;
+      // A file DEFINES a named/spine symbol (the answer) vs merely references the
+      // flow. Past 90% budget, stop pulling INCIDENTAL files — but keep scanning
+      // for necessary ones, which render even past the cap (bounded by maxFiles).
+      // Without this `continue` (was an unconditional `break`), the loop stopped
+      // after the build + validators-exec files and never reached the ranked-in
+      // validate-logic file (Alamofire's Validation.swift).
+      const fileNecessary = group.nodes.some(n =>
+        entryNodeIds.has(n.id) || flow.pathNodeIds.has(n.id) || flow.uniqueNamedNodeIds.has(n.id));
+      if (!fileNecessary && totalChars > budget.maxOutputChars * 0.9) continue;
 
       const absPath = validatePathWithinRoot(projectRoot, filePath);
       if (!absPath || !existsSync(absPath)) continue;
@@ -2419,11 +2467,25 @@ export class ToolHandler {
       const spareNamed = group.nodes.some(n => flow.uniqueNamedNodeIds.has(n.id));
       const fileDefinesSuper = definesPolymorphicSupertype(group.nodes);
       const spared = spareNamed && !fileDefinesSuper;
+      const CALLABLE_BODY = new Set(['method', 'function', 'constructor', 'component']);
+      const hasSpineNode = group.nodes.some(n => flow.pathNodeIds.has(n.id));
+      // On-spine god-file: the flow path runs THROUGH this file, but it also holds
+      // many OTHER named methods, and rendering all of them in full blows the
+      // per-file budget and starves the other flow files (Alamofire: the agent
+      // names ~7 Session.swift methods — the build spine PLUS off-path
+      // task/didCompleteTask — far past the whole response budget). Engage the
+      // per-symbol view to keep the SPINE full and collapse the off-path named
+      // methods to signatures. Only when there IS off-path content to shed —
+      // otherwise the spine is irreducible (a sequential flow has no redundancy),
+      // so leave it to the normal full render.
+      const namedBodyChars = group.nodes
+        .filter(n => CALLABLE_BODY.has(n.kind) && (flow.pathNodeIds.has(n.id) || flow.uniqueNamedNodeIds.has(n.id)))
+        .reduce((s, n) => s + fileLines.slice(n.startLine - 1, Math.min(n.endLine, n.startLine + 220)).join('\n').length, 0);
+      const onSpineGodFile = hasSpineNode
+        && namedBodyChars > budget.maxCharsPerFile
+        && group.nodes.some(n => CALLABLE_BODY.has(n.kind) && flow.uniqueNamedNodeIds.has(n.id) && !flow.pathNodeIds.has(n.id));
       if (adaptiveExploreEnabled() && flow.pathNodeIds.size > 0
-          && !group.nodes.some(n => flow.pathNodeIds.has(n.id))
-          && isPolymorphicSibling(group.nodes)
-          && !spared) {
-        const CALLABLE_BODY = new Set(['method', 'function', 'constructor', 'component']);
+          && (onSpineGodFile || (!hasSpineNode && isPolymorphicSibling(group.nodes) && !spared))) {
         const syms = group.nodes
           .filter(n => n.kind !== 'import' && n.kind !== 'export' && n.startLine > 0)
           .sort((a, b) => a.startLine - b.startLine);
@@ -2443,7 +2505,9 @@ export class ToolHandler {
         let bodyChars = 0;
         for (const n of syms.filter(n => prio(n) < 99 && n.endLine >= n.startLine).sort((a, b) => prio(a) - prio(b))) {
           const sz = fileLines.slice(n.startLine - 1, Math.min(n.endLine, n.startLine + 220)).join('\n').length;
-          if (bodyChars + sz > bodyCap && bodyIds.size > 0) continue;
+          // Spine methods (prio 0) ALWAYS get a full body — the cap governs the
+          // off-path extras (unique-named, family base), never the flow path itself.
+          if (prio(n) > 0 && bodyChars + sz > bodyCap && bodyIds.size > 0) continue;
           bodyIds.add(n.id);
           bodyChars += sz;
         }
@@ -2726,22 +2790,21 @@ export class ToolHandler {
         : headerSymbols.join(', ');
       const fileHeader = `#### ${filePath} — ${headerSuffix}`;
 
-      // Respect the total output cap on a file-by-file basis.
-      if (totalChars + fileSection.length + 200 > budget.maxOutputChars) {
+      // The total cap bounds INCIDENTAL files only. A file that DEFINES a symbol
+      // the agent named (or that's on the flow spine) renders even when the
+      // nominal total is used up — it's the answer, and the set is bounded by
+      // maxFiles AND by true-spine/named-seeding having already trimmed each file
+      // to its necessary content. A file that merely REFERENCES the flow
+      // (Combine.swift name-drops request/task) is incidental → still capped, so
+      // freed budget never leaks into noise. This is the last god-file layer:
+      // build (Session, true-spined) + validators-exec (Request) + validate
+      // (DataRequest/Validation) all render, instead of the cap dropping whichever
+      // phase the file order happened to put last.
+      if (!fileNecessary && totalChars + fileSection.length + 200 > budget.maxOutputChars) {
         const remaining = budget.maxOutputChars - totalChars - 200;
-        if (remaining < 500) break;
-        const trimmed = fileSection.slice(0, remaining) + '\n... (trimmed) ...';
-
-        lines.push(fileHeader);
-        lines.push('');
-        lines.push('```' + lang);
-        lines.push(trimmed);
-        lines.push('```');
-        lines.push('');
-        totalChars += trimmed.length + 200;
-        filesIncluded++;
+        if (remaining < 500) continue; // incidental file, no room — skip it, keep scanning for necessary ones
+        fileSection = fileSection.slice(0, remaining) + '\n... (trimmed) ...';
         anyFileTrimmed = true;
-        break;
       }
 
       lines.push(fileHeader);
@@ -2808,11 +2871,20 @@ export class ToolHandler {
     // maxOutputChars (observed 30k against a 28k tier cap). A fat explore
     // payload persists in the agent's context and is re-read as cache-input
     // on every subsequent turn, so the overrun is paid many times over.
+    // Final ceiling. The render loop is now the authority on WHAT to emit — it
+    // renders necessary files (named/spine) even past maxOutputChars and caps
+    // only incidental ones, all bounded by maxFiles + per-file true-spine — so
+    // this is a SAFETY ceiling above that necessary content, not a hard cut
+    // through it. Cutting at a flat maxOutputChars here undid the whole point:
+    // Alamofire's loop assembles build+validators-exec+validate (~15K) and a 13K
+    // slice dropped the validate phase the agent then Read. Allow necessary
+    // overflow up to 1.5× (still bounds a pathological monolith).
     const output = flow.text + lines.join('\n');
-    if (output.length > budget.maxOutputChars) {
-      const cut = output.slice(0, budget.maxOutputChars);
+    const hardCeiling = Math.round(budget.maxOutputChars * 1.5);
+    if (output.length > hardCeiling) {
+      const cut = output.slice(0, hardCeiling);
       const lastNewline = cut.lastIndexOf('\n');
-      const safe = lastNewline > budget.maxOutputChars * 0.8 ? cut.slice(0, lastNewline) : cut;
+      const safe = lastNewline > hardCeiling * 0.8 ? cut.slice(0, lastNewline) : cut;
       return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
     }
     return this.textResult(output);
