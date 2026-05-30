@@ -43,6 +43,7 @@ Static tree-sitter extraction captures explicit calls (`foo()`, `this.bar()`). I
 | 2 | **Field-backed observer** | `onUpdate(cb)` + `for(cb of cbs)cb()` | callback synthesizer (whole-graph pass) | medium |
 | 3 | **String-keyed EventEmitter** | `on('e',fn)` / `emit('e')` | callback synthesizer (event-keyed) | medium |
 | 4 | **Inline callback handler** | `on('e', function h(){})` / `() => {}` | extraction (named) + synthesizer link-through-body (anon) | named: cheap · anon: hard |
+| 5 | **Closure-collection dispatch** | Swift `validators.write{$0.append(v)}` … `validators.forEach{$0()}` | callback synthesizer (`closureCollectionEdges`, element-invoke gated) | medium |
 
 Key distinction driving the mechanism choice:
 - **A named ref exists** to resolve (`_iterable_class` is an attribute name) → **resolver**.
@@ -77,6 +78,51 @@ Key distinction driving the mechanism choice:
   of `resolveAndPersistBatched`), `src/extraction/tree-sitter.ts` (`visitFunctionBody`
   extracts named nested functions).
 - **Result:** `trace(mutateElement, triggerRender)` → 3 hops; express `use → onmount`.
+
+### 3c. Alamofire deferred validation — closure-collection dispatch (Swift)
+- **Hole:** `DataRequest.validate(_:)` builds a closure and `validators.write { $0.append(validator) }`;
+  the base `Request.didCompleteTask` runs them via `validators.forEach { $0() }`. Append and
+  dispatch live in *different files and classes* (a subclass appends, the base iterates) and the
+  field is a Swift `Protected<[@Sendable () -> Void]>` — so neither same-file pairing nor the
+  name-based registrar match (`onX`/`subscribe`/…) reaches it. `trace(didCompleteTask, validate)`
+  returned no path; the agent grepped `validators` and read three files to reconstruct it.
+- **Fix:** `closureCollectionEdges` (callback-synthesizer.ts). A **dispatcher** iterates a collection
+  *invoking each element* (`coll.forEach { $0() }` / `{ it() }`); a **registrar** appends a closure to
+  the same-named field (`.append`/`.add`/`.push`/`.insert`, incl. Swift `.write { $0.append }`). The
+  element-invoke (`$0(` / `it(`) is the precision **gate** — it proves the collection holds closures —
+  so a repo with no closure-collection dispatch yields **0 edges** regardless of how many `.append`
+  sites it has. Pairs dispatcher → registrar globally by field name (cross-file/class required),
+  fan-out-capped. Surfaced two ways: inline in `trace`, and as a "Dynamic-dispatch links among your
+  symbols" section in `codegraph_explore` (`buildFlowFromNamedSymbols`) so the relationship shows even
+  when the agent named only `validate`, not the `didCompleteTask` that drains the list.
+- **Files:** `src/resolution/callback-synthesizer.ts` (`closureCollectionEdges`),
+  `src/mcp/tools.ts` (`synthEdgeNote` closure-collection case + the explore synth-links section).
+- **Result:** `trace(didCompleteTask, validate)` connects with the closure-collection hop + the
+  `validators.write { $0.append }` wiring site inlined. 9 precise edges on Alamofire
+  (`validators`/`streams`/`finishHandlers`/`requestsToRetry`), **0 on every non-Swift control**.
+  Forced codegraph-only (Read+Grep+Bash blocked): 3/3 runs answer build/send/validate correctly.
+
+### 3d. Insight — an "adoption floor" can hide a trace-endpoint bug (Alamofire)
+Alamofire (110 files) was the README's weakest repo and was written off as the "small-repo floor"
+(native grep is cheap, so the agent reads anyway). It wasn't. Reading the **transcripts** — every
+`Read`'s `file_path`+offset and the assistant text right before it — surfaced the agent's own words:
+*"the trace collided with same-named symbols (44 `request`s, 8 `task`s), let me read by line."*
+`codegraph_trace`'s endpoint disambiguation (`scorePair`, shared-dir-prefix only) was resolving an
+overloaded name to an **empty delegate/protocol stub** — `request` → `EventMonitor.request(){}`
+(a 1-line no-op) over the real `Session.request`, because two unrelated `Source/Features/` stubs
+shared a deeper dir prefix than the correct `Source/Core/` pair. Garbage trace → manual reading,
+sometimes a spiral (12 reads / 11 greps in one run). **Fix:** a `nodeRelevance` term in `handleTrace`
+pair scoring that penalizes empty stubs (≤1 body line) and test-file symbols; among real methods it's
+flat, so path-proximity (cosmos `EndBlocker`) is unaffected. Result (n=8): WITH-arm tool calls
+12 → 8 median, and the read **variance collapsed** (0–12 → 1–4 — the meltdowns *were* the
+trace-collision flounder). General bug: protocol/delegate-stub flooding hits Swift/Java/C#/Go.
+
+**Methodology lesson:** when the agent reads on a small repo, don't conclude "adoption floor" — diff
+*what it read* against what the tool returned *immediately before*. A read of content the tool already
+gave = adoption; a read after the tool returned the **wrong thing** (stub endpoints, collided names) =
+a fixable bug. The transcript reasoning, not the median, tells you which. The forced codegraph-only
+hook (block Read+Grep+Glob+Bash-search) is the variance-free way to confirm sufficiency separately
+from adoption.
 
 ---
 
@@ -188,6 +234,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | Java | MyBatis (XML mappers) | DAO interface method → `<select\|insert\|update\|delete id="X">` SQL | R (XML extract) + S (Java↔XML synthesizer) | ✅ **XML mapper as first-class language** (#389) — `src/extraction/mybatis-extractor.ts` parses files containing `<mapper namespace="...">`; emits one method-shaped node per statement qualified `<namespace>::<id>` + `<sql id="X">` fragments + `<include refid>` references. Non-mapper XML (pom, log4j) → file node only. `mybatisJavaXmlEdges` synthesizer indexes Java methods by `<ClassName>::<methodName>` and joins to XML qualified names by suffix-match — ambiguous simple-name collisions dropped (precision over recall). mall-tiny S **6/6 custom-SQL mapper methods bridge** to their XML statements; full enterprise chain `trace(controller.action → mapper.method-xml)` connects across controller / service-iface / impl / mapper / XML. 🔬 cross-mapper `<include>` via unqualified refid; MyBatis Plus dynamic methods (`BaseMapper<T>` CRUD inherited from framework, not in project); annotation-driven mappers (`@Select("SELECT ...")` on Java methods — the SQL lives in the annotation, not XML) |
 | Kotlin | Spring Boot / Jetpack Compose | request → @RestController → service; @Composable → child | R + X | ✅ **Spring Boot Kotlin** — the Spring resolver was `['java']`-only with a Java-syntax method regex (`public X name()`); extended to `.kt` + Kotlin `fun name(` handler matching (petclinic-kotlin **0→18, 18/18**; class-prefix joins; DI controller→repo resolves — `showOwner ← GET /owners/{ownerId}` → `OwnerRepository.findById`). **Compose composition already static** (@Composable→child are plain function calls — Jetcaster `PodcastInformation→HtmlTextContainer`). Java Spring unchanged (realworld 19/19). 🔬 Ktor `routing { get("/x"){…} }` lambda handlers (anonymous) + Compose recomposition (implicit `mutableStateOf`, no setState gate) + coroutines/Flow |
 | Swift | Vapor | request → route → controller | R + X | ✅ **was 0 routes on every real app** — the extractor required an `app/router/routes` receiver + a `"path"` literal, but real Vapor routes on grouped builders (`let todos = routes.grouped("todos"); todos.get(use: index)`) with NO path arg. Rewrote: any receiver, optional/non-string path segments, `.grouped`/`.group{}` prefix tracking, `use:` discriminator. vapor-template S **0→3 (3/3**, nested `/todos/:todoID`), SteamPress M **0→27 (27/27)**, SwiftPackageIndex-Server L **0→14 (14/14** handler resolution). 🔬 typed-route enums (SPI `SiteURL.x.pathComponents` — path label only, handler still resolves) + closure handlers `app.get("x"){ }` (anonymous) |
+| Swift | Alamofire / closure-collection | request → build → send → **validate** (deferred closures) | S | ✅ **closure-collection dispatch synthesizer** (`closureCollectionEdges`): the Swift deferred-handler pattern `DataRequest.validate` `validators.write{$0.append(v)}` … base `Request.didCompleteTask` `validators.forEach{$0()}` (append + dispatch in different files/classes, field is `Protected<[() -> Void]>`). The element-invoke `$0(`/`it(` is the precision gate → **9 edges on Alamofire** (validators/streams/finishHandlers/requestsToRetry), **0 on every non-closure-collection control**. Surfaced inline in `trace` + as an explore "Dynamic-dispatch links" section (so it shows when the agent named only `validate`, not the `didCompleteTask` that drains the list). Forced codegraph-only: **3/3** build/send/validate correct. + **trace endpoint relevance** (`nodeRelevance`): overloaded `request`/`task` (44/8 defs, mostly empty `EventMonitor` delegate stubs) now resolve to the real `Session.request`, not a 1-line no-op — **WITH-arm tool calls 12→8 median, read variance 0–12→1–4** (the meltdowns were all the trace-collision flounder); control-safe (excalidraw/okhttp/gin traces intact, gin A/B 0 reads). 🔬 god-file explore body-trim (Session.swift > per-file cap drops the *named* `Session.request` body — wants relevance-first selection, not a bigger cap) |
 | C# | ASP.NET Core | request → [Http*] action → DI service → EF | X | ✅ **feature-folder detection** (realworld 0→19 — was undetected) + **bare `[HttpGet]` + class `[Route]` prefix** (eShopOnWeb 9→33 / jellyfin L) — co-located so no claimsReference needed. 🔬 EF Core LINQ/DbSet (metaprogramming frontier) |
 | Ruby | Rails / Sinatra | request → routes.rb → Controller#action → model | R | ✅ **RESTful `resources`/`resource` routing → controller#action** (realworld S 16 / spree M / forem L), pluralization + only/except + claimsReference; explicit routes fixed to precise `controller#action` too. 🔬 ActiveRecord dynamic finders (`Article.find_by_slug`) — metaprogramming frontier |
 | PHP | Laravel | request → route → controller → Eloquent | R | ✅ **precise `Route::get([Ctrl::class,'m'])` / `'Ctrl@m'` → Ctrl@method** (realworld S / firefly M / bookstack L) — was resolving the bare method name to the WRONG controller (every `index`→ArticleController); Route::resource→controller. 🔬 Eloquent dynamic finders/relationships (metaprogramming frontier) |

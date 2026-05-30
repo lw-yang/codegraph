@@ -1586,10 +1586,28 @@ export class ToolHandler {
       - (isLessCanonicalPath(b) ? LESS_CANONICAL_PENALTY : 0);
     const fromCands = fromMatches.nodes;
     const toCands = toMatches.nodes;
+    // Candidate relevance: an overloaded name (Alamofire has 44 `request`s, most
+    // of them EMPTY EventMonitor protocol-conformance stubs `func request(…){}`)
+    // floods the pool with no-op decls. Shared-dir-prefix alone then MISLEADS —
+    // two unrelated `Source/Features/` delegate stubs outscore the real
+    // `Source/Core/Session.request` × `Source/Core/…task` pair the agent meant,
+    // so trace resolves to stubs, finds no path, and the agent reads by line.
+    // Penalize empty stubs and test-file symbols so a substantive entry point
+    // wins; among real methods this is ~flat, so path-proximity still decides
+    // (cosmos EndBlocker disambiguation is unaffected — none of its candidates
+    // are stubs/tests).
+    const isTestPath = (p: string): boolean => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
+    const nodeRelevance = (n: Node): number => {
+      const bodyLines = Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
+      let s = Math.min(bodyLines, 20);     // a substantive body is more likely the meant symbol
+      if (bodyLines <= 1) s -= 40;          // empty/one-line stub (protocol no-op, decl-only) — almost never the trace endpoint
+      if (isTestPath(n.filePath)) s -= 150; // a Source/ symbol is meant over a Tests/ same-named one
+      return s;
+    };
     const pairs: Array<{ f: Node; t: Node; score: number }> = [];
     for (const f of fromCands) {
       for (const t of toCands) {
-        pairs.push({ f, t, score: scorePair(f.filePath, t.filePath) });
+        pairs.push({ f, t, score: scorePair(f.filePath, t.filePath) + nodeRelevance(f) + nodeRelevance(t) });
       }
     }
     // Sort by shared prefix desc, then by FTS order (already encoded in the
@@ -1843,6 +1861,14 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'closure-collection') {
+      const field = m.field ? `\`${String(m.field)}\`` : 'a collection';
+      return {
+        label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
+        compact: `dynamic: runs ${field} handlers${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 
@@ -2001,20 +2027,62 @@ export class ToolHandler {
         chain.reverse();
         if (!best || chain.length > best.length) best = chain;
       }
-      if (!best || best.length < 3) return EMPTY;
-      const out = ['## Flow (call path among the symbols you queried)', ''];
-      for (let i = 0; i < best.length; i++) {
-        const step = best[i]!;
-        if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
-        out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+      const hasMain = !!best && best.length >= 3;
+      const pathIds = new Set((best ?? []).map((s) => s.node.id));
+
+      // Supplementary: dynamic-dispatch (synthesized) edges incident to a NAMED
+      // symbol — the indirect hops an agent would otherwise grep/Read to
+      // reconstruct ("where do the appended `validators` actually run?"). The
+      // synth edge IS that answer, so surface it even when the OTHER end wasn't
+      // named (e.g. the agent names `validate` but not the `didCompleteTask`
+      // that drains the collection). On-topic by construction: only heuristic
+      // edges touching a symbol the agent named; skipped when the hop already
+      // shows in the main chain.
+      const synthLines: string[] = [];
+      const synthSeen = new Set<string>();
+      for (const n of named.values()) {
+        if (synthLines.length >= 6) break;
+        for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+          if (synthLines.length >= 6) break;
+          if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+          if (pathIds.has(edge.source) && pathIds.has(edge.target)) continue; // already in the main chain
+          const src = edge.source === n.id ? n : other;
+          const tgt = edge.source === n.id ? other : n;
+          const key = `${src.name}>${tgt.name}`;
+          if (synthSeen.has(key)) continue;
+          synthSeen.add(key);
+          const note = this.synthEdgeNote(edge);
+          synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
+        }
       }
-      out.push('', '> Full source for these symbols is below; codegraph_trace(from,to) for the exact path between two endpoints.', '');
+
+      if (!hasMain && synthLines.length === 0) return EMPTY;
+      const out: string[] = [];
+      if (hasMain) {
+        out.push('## Flow (call path among the symbols you queried)', '');
+        for (let i = 0; i < best!.length; i++) {
+          const step = best![i]!;
+          if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
+          out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
+        }
+        out.push('');
+      }
+      if (synthLines.length) {
+        out.push(
+          '## Dynamic-dispatch links among your symbols',
+          '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
+          '',
+          ...synthLines,
+          ''
+        );
+      }
+      out.push('> Full source for these symbols is below; codegraph_trace(from,to) for the exact path between two endpoints.', '');
       // namedNodeIds = every callable the agent explicitly named (a superset of
       // the spine). A file holding one is something the agent asked to SEE, so it
       // must keep full source even if it's an off-spine polymorphic sibling — the
       // agent named `getResponseWithInterceptorChain` / `SQLCompiler.execute_sql`
       // as the mechanism, not as an interchangeable leaf. See the skeleton gate.
-      return { text: out.join('\n'), pathNodeIds: new Set(best.map((s) => s.node.id)), namedNodeIds: new Set(named.keys()), uniqueNamedNodeIds };
+      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set(named.keys()), uniqueNamedNodeIds };
     } catch {
       return EMPTY;
     }
