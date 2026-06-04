@@ -517,6 +517,15 @@ export class TreeSitterExtractor {
       ...extra,
     };
 
+    // Persist extra symbol-level modifiers (e.g. Kotlin `expect`/`actual`) onto
+    // the node's decorators list so the resolver can pair multiplatform
+    // declarations with their implementations. Merged, not overwritten, so a
+    // language that also captures real annotations keeps both.
+    const mods = this.extractor?.extractModifiers?.(node);
+    if (mods && mods.length > 0) {
+      newNode.decorators = [...(newNode.decorators ?? []), ...mods];
+    }
+
     this.nodes.push(newNode);
 
     // Add containment edge from parent

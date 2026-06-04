@@ -506,6 +506,72 @@ function goImplementsEdges(queries: QueryBuilder): Edge[] {
   return edges;
 }
 
+/**
+ * Kotlin Multiplatform `expect`/`actual` linking. A `common` source set declares
+ * `expect fun foo()` / `expect class Bar`; each platform source set (jvm, native,
+ * js, …) provides an `actual` implementation with the IDENTICAL fully-qualified
+ * name in a different file. Callers in common code resolve to the `expect`
+ * declaration, so every `actual` impl ends up with zero dependents — invisible to
+ * impact/affected even though editing it can break every caller of the API.
+ *
+ * Synthesize a `calls` edge from the common declaration to each platform `actual`
+ * (mirroring the interface-impl bridge: abstract → concrete), so editing a
+ * platform impl surfaces the common `expect` and its callers, and the impl file
+ * participates in the graph.
+ *
+ * `expect`/`actual` are captured onto the node's `decorators` list at extraction
+ * (kotlin.ts `extractModifiers`). Members of an `expect class` are NOT themselves
+ * keyword-marked, so the declaration side is matched as the same-FQN, same-kind
+ * node that is NOT marked `actual`. Requiring an `actual`-marked counterpart also
+ * gates out plain cross-file overloads (neither side is marked).
+ */
+// Kinds that an `expect`/`actual` pair may legitimately straddle. `expect class`
+// is routinely fulfilled by an `actual typealias` (e.g. `actual typealias
+// CancellationException = …`, `actual typealias SchedulerTask = Task`), so a
+// strict kind match would miss those one-line alias files. Same-FQN + the
+// `actual` marker already gates out unrelated symbols, so widening to the
+// type-like kinds is safe.
+const KMP_TYPE_KINDS = new Set(['class', 'interface', 'struct', 'enum', 'type_alias']);
+function kmpKindsCompatible(a: string, b: string): boolean {
+  return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
+}
+
+function kotlinExpectActualEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const actuals = queries
+    .getAllNodes()
+    .filter((n) => n.language === 'kotlin' && !!n.decorators?.includes('actual'));
+  for (const act of actuals) {
+    let added = 0;
+    for (const cand of queries.getNodesByQualifiedNameExact(act.qualifiedName)) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      // The declaration side: same FQN + compatible kind, a different file, NOT
+      // itself an `actual` (that would be a sibling platform impl, not the decl).
+      if (cand.language !== 'kotlin' || cand.id === act.id) continue;
+      if (!kmpKindsCompatible(cand.kind, act.kind) || cand.filePath === act.filePath) continue;
+      if (cand.decorators?.includes('actual')) continue;
+      const key = `${cand.id}>${act.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: cand.id,
+        target: act.id,
+        kind: 'calls',
+        line: cand.startLine,
+        provenance: 'heuristic',
+        metadata: {
+          synthesizedBy: 'kotlin-expect-actual',
+          via: act.name,
+          registeredAt: `${act.filePath}:${act.startLine}`,
+        },
+      });
+      added++;
+    }
+  }
+  return edges;
+}
+
 function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1266,6 +1332,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
@@ -1284,6 +1351,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...flutterEdges,
     ...cppEdges,
     ...ifaceEdges,
+    ...kotlinExpectActual,
     ...goGrpcEdges,
     ...rnEventEdgesList,
     ...fabricNativeEdges,
