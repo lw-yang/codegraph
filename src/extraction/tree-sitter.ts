@@ -148,6 +148,18 @@ function scalaBaseTypeName(node: SyntaxNode | null, source: string): string | nu
 }
 
 /**
+ * PHP type-position wrapper node kinds (a type-hint is `named_type`,
+ * `?Foo` is `optional_type`, `A|B` is `union_type`, `A&B` is
+ * `intersection_type`). Used to find the type subtree inside a parameter /
+ * property / return position before walking it for class references.
+ */
+const PHP_TYPE_NODES: ReadonlySet<string> = new Set([
+  'named_type', 'optional_type', 'nullable_type',
+  'union_type', 'intersection_type', 'disjunctive_normal_form_type',
+  'primitive_type',
+]);
+
+/**
  * Tree-sitter node kinds that represent constructor invocations
  * (`new Foo()` and friends). Used by extractInstantiation to emit
  * an `instantiates` reference targeting the class name.
@@ -1760,6 +1772,13 @@ export class TreeSitterExtractor {
           const parentId = this.nodeStack[this.nodeStack.length - 1];
           if (parentId) this.emitRustUseBindingRefs(node, parentId);
         }
+        // PHP `use Foo\Bar\Baz;` — link to the namespace-qualified definition so
+        // an imported-but-DI-injected contract (Laravel's pattern) records a
+        // cross-file dependency. Grouped imports are handled in their own branch.
+        if (this.language === 'php' && node.type === 'namespace_use_declaration') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitPhpUseRefs(node, parentId);
+        }
         return;
       }
       // Hook returned null — fall through to multi-import inline handlers only
@@ -1847,6 +1866,8 @@ export class TreeSitterExtractor {
             this.createNode('import', fullPath, node, {
               signature: importText,
             });
+            const parentId = this.nodeStack[this.nodeStack.length - 1];
+            if (parentId) this.pushPhpUseRef(fullPath, parentId, node);
           }
         }
         return;
@@ -2009,6 +2030,36 @@ export class TreeSitterExtractor {
         column: p.node.startPosition.column,
       });
     }
+  }
+
+  /**
+   * Emit an `imports` reference for a single PHP `use Foo\Bar\Baz;` (grouped
+   * imports `use Foo\{A, B}` are handled where their per-item nodes are created).
+   * The reference targets the namespace-qualified `Foo\Bar::Baz` form classes are
+   * stored under (see the PHP `namespace` capture), so it resolves to the RIGHT
+   * definition — Laravel has many same-named contracts (`Factory`, `Dispatcher`,
+   * `Guard`) across namespaces that a bare-name match can't disambiguate.
+   */
+  private emitPhpUseRefs(node: SyntaxNode, fromNodeId: string): void {
+    const clause = node.namedChildren.find((c: SyntaxNode) => c.type === 'namespace_use_clause');
+    if (!clause) return;
+    const qn = clause.namedChildren.find((c: SyntaxNode) => c.type === 'qualified_name')
+      ?? clause.namedChildren.find((c: SyntaxNode) => c.type === 'name');
+    if (qn) this.pushPhpUseRef(getNodeText(qn, this.source), fromNodeId, node);
+  }
+
+  /** Convert a PHP FQN `Foo\Bar\Baz` to the stored `Foo\Bar::Baz` and emit an `imports` ref. */
+  private pushPhpUseRef(fqn: string, fromNodeId: string, node: SyntaxNode): void {
+    const clean = fqn.replace(/^\\/, '');
+    const lastSep = clean.lastIndexOf('\\');
+    if (lastSep < 0) return; // global-namespace class — already matches by simple name
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: `${clean.slice(0, lastSep)}::${clean.slice(lastSep + 1)}`,
+      referenceKind: 'imports',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
   }
 
   /**
@@ -2984,7 +3035,16 @@ export class TreeSitterExtractor {
    * Languages that support type annotations (TypeScript, etc.)
    */
   private readonly TYPE_ANNOTATION_LANGUAGES = new Set([
-    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala',
+    'typescript', 'tsx', 'dart', 'kotlin', 'swift', 'rust', 'go', 'java', 'csharp', 'scala', 'php',
+  ]);
+
+  /**
+   * PHP pseudo-types and `self`/`static`/`parent` that aren't project symbols.
+   * (Scalar primitives parse as `primitive_type` and are skipped structurally.)
+   */
+  private readonly PHP_PSEUDO_TYPES = new Set([
+    'self', 'static', 'parent', 'mixed', 'object', 'iterable', 'callable', 'void',
+    'null', 'false', 'true', 'never', 'array', 'int', 'float', 'string', 'bool',
   ]);
 
   /**
@@ -3022,6 +3082,17 @@ export class TreeSitterExtractor {
     // parameter NAMES never accidentally surface as type refs (#381).
     if (this.language === 'csharp') {
       this.extractCsharpTypeRefs(node, nodeId);
+      return;
+    }
+
+    // PHP type-hints are `named_type`/`optional_type`/`union_type` wrapping a
+    // `name`/`qualified_name` — never `type_identifier` — so the generic walker
+    // below emits nothing for them. Dispatch to a PHP-aware path that walks only
+    // type positions (parameter / return / property types), so type-hinted
+    // dependencies (the constructor-injected contracts that dominate Laravel) are
+    // recorded and a `variable_name` like `$events` never mis-emits as a ref.
+    if (this.language === 'php') {
+      this.extractPhpTypeRefs(node, nodeId);
       return;
     }
 
@@ -3175,6 +3246,63 @@ export class TreeSitterExtractor {
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (child) this.walkCsharpTypePosition(child, fromNodeId);
+    }
+  }
+
+  /**
+   * Extract PHP type references from a method/function/property declaration.
+   * Walks ONLY type positions: each parameter's type child (inside
+   * `formal_parameters`), the return type, and a property's type — all
+   * `named_type` / `optional_type` / `union_type` / … direct children. Parameter
+   * and property NAMES are `variable_name` (`$x`), never type nodes, so they
+   * can't be mis-emitted.
+   */
+  private extractPhpTypeRefs(node: SyntaxNode, nodeId: string): void {
+    const params = node.namedChildren.find((c: SyntaxNode) => c.type === 'formal_parameters');
+    if (params) {
+      for (const p of params.namedChildren) {
+        // simple_parameter / property_promotion_parameter / variadic_parameter
+        for (const c of p.namedChildren) {
+          if (PHP_TYPE_NODES.has(c.type)) this.walkPhpTypePosition(c, nodeId);
+        }
+      }
+    }
+    // Return type (method/function) and property type are TYPE nodes that are
+    // DIRECT children of the declaration.
+    for (const c of node.namedChildren) {
+      if (PHP_TYPE_NODES.has(c.type)) this.walkPhpTypePosition(c, nodeId);
+    }
+  }
+
+  /** Walk a PHP subtree KNOWN to be in a type position; emit class/interface refs. */
+  private walkPhpTypePosition(node: SyntaxNode, fromNodeId: string): void {
+    if (node.type === 'primitive_type') return; // int/string/void/…
+    if (node.type === 'name') {
+      const name = getNodeText(node, this.source);
+      if (name && !this.PHP_PSEUDO_TYPES.has(name)) {
+        this.unresolvedReferences.push({
+          fromNodeId, referenceName: name, referenceKind: 'references',
+          line: node.startPosition.row + 1, column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    if (node.type === 'qualified_name') {
+      // `App\Contracts\Logger` → match on the trailing simple name (what the
+      // class node is stored as, and what a `use` import brings into scope).
+      const last = getNodeText(node, this.source).split('\\').pop() ?? '';
+      if (last && !this.PHP_PSEUDO_TYPES.has(last)) {
+        this.unresolvedReferences.push({
+          fromNodeId, referenceName: last, referenceKind: 'references',
+          line: node.startPosition.row + 1, column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+    // optional_type / nullable_type / union_type / intersection_type / named_type → recurse
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) this.walkPhpTypePosition(child, fromNodeId);
     }
   }
 
