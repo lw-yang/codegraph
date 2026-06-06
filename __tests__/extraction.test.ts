@@ -4360,6 +4360,43 @@ describe('SvelteKit load → page synthesizer', () => {
   });
 });
 
+describe('Nuxt nested auto-imported component resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a `<MediaCard/>` usage to components/media/Card.vue (Nuxt dir-prefixed auto-import)', async () => {
+    // Nuxt auto-imports a nested component by a DIRECTORY-PREFIXED name —
+    // components/media/Card.vue is used as <MediaCard/>, not <Card/> — but the
+    // component node is named by basename (`Card`), so the PascalCase usage
+    // didn't resolve and the nested component looked unused.
+    const media = path.join(tempDir, 'components/media');
+    fs.mkdirSync(media, { recursive: true });
+    fs.writeFileSync(path.join(media, 'Card.vue'), `<template><div>card</div></template>\n<script setup>defineProps(['item'])</script>\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'components/Grid.vue'),
+      `<template>\n  <div><MediaCard :item="i" /></div>\n</template>\n<script setup>const i = {}</script>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const card = cg.getNodesByKind('component').find((n) => n.filePath.endsWith('media/Card.vue'));
+    expect(card, 'media/Card.vue component').toBeDefined();
+    const deps = [...cg.getImpactRadius(card!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('components/Grid.vue')), '<MediaCard> links Grid to media/Card.vue').toBe(true);
+  });
+});
+
 describe('Swift property-wrapper attribute type references', () => {
   let tempDir: string;
   let cg: CodeGraph;

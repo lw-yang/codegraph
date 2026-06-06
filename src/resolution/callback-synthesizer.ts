@@ -42,6 +42,10 @@ const MAX_JSX_CHILDREN = 30;
 // event bindings (@click="fn" / v-on:click="fn"). PascalCase children (<VPNav/>)
 // are already caught by JSX_TAG_RE via the SFC component node.
 const VUE_KEBAB_RE = /<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]/g;
+// PascalCase component tags — `<MediaCard ...>`, `<NavBar/>`. HTML elements are
+// lowercase, so an uppercase-initial tag is a component usage; built-ins
+// (`<NuxtLink>`, `<Transition>`) simply resolve to nothing and emit no edge.
+const VUE_PASCAL_RE = /<([A-Z][A-Za-z0-9]*)[\s/>]/g;
 const VUE_HANDLER_RE = /(?:@|v-on:)([a-zA-Z][\w-]*)(?:\.[\w]+)*\s*=\s*"([^"]+)"/g;
 // Composable/hook destructure: `const { close: closeSidebar } = useSidebarControl()`.
 // Captures the destructure body + the called composable; only `use*` calls qualify.
@@ -62,6 +66,30 @@ const CC_FANOUT_CAP = 8; // skip a field name with more dispatchers/registrars t
 
 function kebabToPascal(s: string): string {
   return s.split('-').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('');
+}
+
+/**
+ * Nuxt auto-import name for a component, derived from its path UNDER `components/`:
+ * `components/media/Card.vue` → `MediaCard`, `components/base/foo/Bar.vue` →
+ * `BaseFooBar`. Each directory segment and the filename is PascalCased and
+ * concatenated; a directory whose PascalCase name prefixes the next segment is
+ * collapsed (Nuxt's de-dup: `base/BaseButton.vue` → `BaseButton`, not
+ * `BaseBaseButton`). Returns null for a flat component (`components/NavBar.vue`)
+ * — its node is already named by basename, so a direct tag match finds it.
+ */
+function nuxtComponentName(filePath: string): string | null {
+  const marker = filePath.lastIndexOf('components/');
+  if (marker === -1) return null;
+  const rel = filePath.slice(marker + 'components/'.length).replace(/\.(vue|ts|tsx|js|jsx)$/i, '');
+  const segs = rel.split('/').filter(Boolean).map(kebabToPascal);
+  if (segs.length < 2) return null;
+  const out: string[] = [];
+  for (const s of segs) {
+    const prev = out[out.length - 1];
+    if (prev && s.startsWith(prev)) out[out.length - 1] = s;
+    else out.push(s);
+  }
+  return out.join('');
 }
 
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
@@ -801,6 +829,16 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
   // A composable's returned member may be a fn (`function close(){}`) or an
   // arrow assigned to a const (`const close = () => {}`).
   const RETURN_KINDS = new Set(['method', 'function', 'variable', 'constant']);
+  // Nuxt auto-imports nested components by a DIRECTORY-PREFIXED name —
+  // `components/media/Card.vue` is used as `<MediaCard/>`, not `<Card/>` — but
+  // the component node is named by basename (`Card`), so a direct tag match
+  // misses it (flat components match by basename and don't need this). Map each
+  // nested component's Nuxt name → node so those template usages resolve.
+  const nuxtComponents = new Map<string, Node>();
+  for (const c of ctx.getNodesByKind('component')) {
+    const nn = nuxtComponentName(c.filePath);
+    if (nn && !nuxtComponents.has(nn)) nuxtComponents.set(nn, c);
+  }
   for (const file of ctx.getAllFiles()) {
     if (!file.endsWith('.vue')) continue;
     const content = ctx.readFile(file);
@@ -842,7 +880,18 @@ function vueTemplateEdges(ctx: ResolutionContext): Edge[] {
 
     let m: RegExpExecArray | null;
     VUE_KEBAB_RE.lastIndex = 0;
-    while ((m = VUE_KEBAB_RE.exec(tpl))) addEdge(resolve(kebabToPascal(m[1]!), COMPONENT_KINDS), { synthesizedBy: 'jsx-render', via: m[1] });
+    while ((m = VUE_KEBAB_RE.exec(tpl))) {
+      const tag = kebabToPascal(m[1]!);
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: m[1] });
+    }
+    // PascalCase component tags. Try a direct name match first (flat components
+    // and explicit registrations), then the Nuxt dir-prefixed auto-import name
+    // (`<MediaCard>` → components/media/Card.vue). Built-ins match neither → no edge.
+    VUE_PASCAL_RE.lastIndex = 0;
+    while ((m = VUE_PASCAL_RE.exec(tpl))) {
+      const tag = m[1]!;
+      addEdge(resolve(tag, COMPONENT_KINDS) ?? nuxtComponents.get(tag), { synthesizedBy: 'jsx-render', via: tag });
+    }
     VUE_HANDLER_RE.lastIndex = 0;
     while ((m = VUE_HANDLER_RE.exec(tpl))) {
       const event = m[1]!;
