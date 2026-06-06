@@ -121,9 +121,21 @@ export const EXTENSION_MAP: Record<string, Language> = {
  */
 export function isSourceFile(filePath: string): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
+  if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   return filePath.slice(dot).toLowerCase() in EXTENSION_MAP;
+}
+
+/**
+ * Shopify OS 2.0 JSON template (`templates/*.json`) or section group
+ * (`sections/*.json`) — these reference sections by `"type"`, so the Liquid
+ * extractor links them. (config/ + locales/ JSON have no section refs.)
+ */
+export function isShopifyLiquidJson(filePath: string): boolean {
+  // Allow nested template dirs (`templates/customers/login.json`), not just
+  // top-level (`templates/product.json`).
+  return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
 }
 
 /**
@@ -246,6 +258,9 @@ export function detectLanguage(filePath: string, source?: string): Language {
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
   const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+  // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
+  // links each section `"type"` to its `sections/<type>.liquid`).
+  if (isShopifyLiquidJson(filePath)) return 'liquid';
   const lang = EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
