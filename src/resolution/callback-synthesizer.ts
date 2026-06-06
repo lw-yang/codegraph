@@ -1500,6 +1500,35 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
 }
 
 /**
+ * Delphi form code-behind: a form unit `UFRMAbout.pas` owns its visual form
+ * definition `UFRMAbout.dfm` (VCL) / `.fmx` (FireMonkey) — paired by basename in
+ * the same directory, wired by the `{$R *.dfm}` directive rather than a `uses`
+ * clause. Link the unit → its form so a `.dfm`/`.fmx` used only as a form
+ * definition isn't orphaned, and editing the form surfaces its code-behind unit.
+ */
+function pascalFormEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const allFiles = new Set(ctx.getAllFiles());
+  for (const file of allFiles) {
+    if (!/\.(dfm|fmx)$/i.test(file)) continue;
+    const pasFile = file.replace(/\.(dfm|fmx)$/i, '.pas');
+    if (!allFiles.has(pasFile)) continue;
+    const formNode = ctx.getNodesInFile(file).find((n) => n.kind === 'file');
+    const unitNode = ctx.getNodesInFile(pasFile).find((n) => n.kind === 'file');
+    if (!formNode || !unitNode) continue;
+    edges.push({
+      source: unitNode.id,
+      target: formNode.id,
+      kind: 'references',
+      line: unitNode.startLine,
+      provenance: 'heuristic',
+      metadata: { synthesizedBy: 'pascal-form', registeredAt: pasFile },
+    });
+  }
+  return edges;
+}
+
+/**
  * SvelteKit file-convention data flow. A route directory's `+page.svelte` (a
  * `component` node) receives its `data` from the sibling `+page.server.{ts,js}`
  * / `+page.{ts,js}` `load` function and posts forms to its `actions` — wired by
@@ -1570,6 +1599,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const jsxEdges = reactJsxChildEdges(ctx);
   const vueEdges = vueTemplateEdges(ctx);
   const svelteKitEdges = svelteKitLoadEdges(ctx);
+  const pascalEdges = pascalFormEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
@@ -1592,6 +1622,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...jsxEdges,
     ...vueEdges,
     ...svelteKitEdges,
+    ...pascalEdges,
     ...flutterEdges,
     ...cppEdges,
     ...ifaceEdges,
