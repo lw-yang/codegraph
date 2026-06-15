@@ -47,16 +47,34 @@ Method per repo: index the same tree twice (value-refs on vs `CODEGRAPH_VALUE_RE
 diff node/edge counts, spot-check precision, and measure `codegraph impact` on a few
 file-scope consts. Node count must be **identical** on/off (edges-only feature).
 
+**TypeScript**
+
 | Repo | size | files | nodes (on=off) | +value-ref edges | precision | `impact` on→off example |
 |---|---|---|---|---|---|---|
 | sindresorhus/ky | small | 54 | 562 (stable) | +29 (0.8%) | all sampled TP | — |
 | excalidraw/excalidraw | medium | 645 | 10,301 (stable) | +717 (1.6%) | TP after shadow prune (#895 removed 23 woff2-bundle FPs) | `tablerIconProps` 1→**170** |
-| microsoft/vscode | large | 11,548 | 333,999 (stable) | +10,605 (0.69%) | all sampled TP; no param-shadow / bundle FPs in top 200 | `LayoutStateKeys` 1→**85**, `CORE_WEIGHT` 1→52, `CONTEXT_FOLDING_ENABLED` 1→22 |
+| microsoft/vscode | large | 11,548 | 333,999 (stable) | +10,605 (0.69%) | all sampled TP; no param-shadow / bundle FPs in top 200 | `LayoutStateKeys` 1→**85**, `CORE_WEIGHT` 1→52 |
 
-Across S/M/L: node count never moved, edge growth ≤1.6%, and the precision guards held
-(the only false positives — excalidraw's 23 — were a single bundled file, fixed by the
-shadow prune). The `impact` OFF column is the bug: a const that 85 symbols read reports
-"1 affected" without value-refs.
+**JavaScript** (same extractor; CommonJS, `var`, IIFE/UMD)
+
+| Repo | size | files | nodes (on=off) | +value-ref edges | precision | `impact` on→off example |
+|---|---|---|---|---|---|---|
+| expressjs/express | small | 147 | 1,082 (stable) | +27 (0.75%) | all sampled TP | — |
+| eslint/eslint | medium | 1,420 | 7,167 (stable) | +1,192 (4.2%) | all sampled TP; guard holds; no minified-file FPs | `internalSlotsMap` 1→**32**, `INDEX_MAP` 1→27 |
+| webpack/webpack | large | 9,371 | 28,922 (stable) | +3,521 (4.8%) | all sampled TP; guard holds; no minified-file FPs | `LogType` 1→**89**, `LOG_SYMBOL` 1→90, `UsageState` 2→52 |
+
+Across S/M/L on both languages: node count never moved, the precision guards held, and the
+`impact` OFF column is the bug — a const that 85–90 symbols read reports "1 affected"
+without value-refs. The only false positives ever seen were excalidraw's 23 (one bundled
+file, fixed by the shadow prune); no new FP class surfaced in JS.
+
+**JavaScript note — CommonJS `require` bindings are targets, and that's correct.** JS edge
+growth (~4–5%) runs higher than TS (~0.7–1.6%) because `var x = require('…')` bindings and
+module-level `var` state pass the distinctive-name gate and are read by same-file functions.
+These are *not* noise: changing such a binding (swap the dependency, reassign the state)
+genuinely affects its readers, so it's a legitimate impact target. Where it overlaps an
+existing `calls` edge, `getImpactRadius` dedups by node — no double-counting. (TS `import`s
+dodge this entirely: they're `import`-kind nodes, not `const`/`var`, so never targets.)
 
 ## Agent A/B — what it does and doesn't buy (excalidraw, sonnet/high, 12 runs)
 
