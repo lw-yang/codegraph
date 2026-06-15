@@ -68,6 +68,12 @@ Across S/M/L on both languages: node count never moved, the precision guards hel
 without value-refs. The only false positives ever seen were excalidraw's 23 (one bundled
 file, fixed by the shadow prune); no new FP class surfaced in JS.
 
+**`tsx` is covered by the TS rows** — excalidraw is a React/.tsx codebase, so the headline
+`tablerIconProps` (1→170) and most of its targets live in `.tsx` files. The one
+tsx-specific path — a const read *only* inside JSX (`<Foo x={CONST}/>`) — relies on the
+reader-scan descending into the JSX subtree; it's locked by a unit test
+(`value-reference-edges.test.ts`), so no separate tsx repo sweep is needed.
+
 **JavaScript note — CommonJS `require` bindings are targets, and that's correct.** JS edge
 growth (~4–5%) runs higher than TS (~0.7–1.6%) because `var x = require('…')` bindings and
 module-level `var` state pass the distinctive-name gate and are read by same-file functions.

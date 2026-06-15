@@ -98,6 +98,25 @@ describe('value-reference edges', () => {
     expect(valueRefReaders(cg, 'Module')).toEqual([]);
   });
 
+  it('edges readers that use the const only inside JSX (.tsx)', async () => {
+    // The tsx-specific path: the const is read ONLY inside JSX expressions, so
+    // the reader-scan must descend into the JSX subtree to find it.
+    fs.writeFileSync(
+      path.join(dir, 'widget.tsx'),
+      [
+        'export const THEME_TOKENS = { color: "red", size: 12 };',
+        'export function Label() {',
+        '  return <span style={{ color: THEME_TOKENS.color }}>hi</span>;',
+        '}',
+        'export const Box = () => <div data-size={THEME_TOKENS.size} />;',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(valueRefReaders(cg, 'THEME_TOKENS')).toEqual(expect.arrayContaining(['Label', 'Box']));
+  });
+
   it('emits nothing when CODEGRAPH_VALUE_REFS=0', async () => {
     const prev = process.env.CODEGRAPH_VALUE_REFS;
     process.env.CODEGRAPH_VALUE_REFS = '0';
