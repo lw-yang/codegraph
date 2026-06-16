@@ -645,6 +645,66 @@ describe('value-reference edges', () => {
     expect(valueRefReaders(cg, 'TIMEOUT')).toEqual([]);
   });
 
+  it('edges same-file functions to a unit-scope const (Pascal)', async () => {
+    // Pascal keeps shareable constants in a `const` section at unit (file) scope
+    // (and class scope). They already extract as `constant`. A const reference is
+    // an `identifier`; the catch is that Pascal attaches a proc body (`block`) as
+    // a sibling of the proc header (`declProc`, the reader scope), so the
+    // reader-scan pulls in that sibling.
+    fs.writeFileSync(
+      path.join(dir, 'demo.pas'),
+      [
+        'unit Demo;',
+        'interface',
+        'const',
+        '  MAX_ITEMS = 100;',
+        "  APP_NAME = 'MyApp';",
+        'implementation',
+        'function Capped(n: Integer): Integer;',
+        'begin',
+        '  if n > MAX_ITEMS then Capped := MAX_ITEMS else Capped := n;',
+        'end;',
+        'function AppLabel: string;',
+        'begin',
+        '  AppLabel := APP_NAME;',
+        'end;',
+        'end.',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(valueRefReaders(cg, 'MAX_ITEMS')).toEqual(expect.arrayContaining(['Capped']));
+    expect(valueRefReaders(cg, 'APP_NAME')).toEqual(expect.arrayContaining(['AppLabel']));
+  });
+
+  it('does NOT edge a Pascal unit const shadowed by a function-local const of the same name', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'shadow.pas'),
+      [
+        'unit Shadow;',
+        'interface',
+        'const',
+        '  TIMEOUT = 30;',
+        'implementation',
+        'function UsesConst: Integer;',
+        'begin',
+        '  UsesConst := TIMEOUT;',
+        'end;',
+        'function Shadows: Integer;',
+        'const TIMEOUT = 5;',
+        'begin',
+        '  Shadows := TIMEOUT;',
+        'end;',
+        'end.',
+      ].join('\n'),
+    );
+    cg = index();
+    await cg.indexAll();
+
+    expect(valueRefReaders(cg, 'TIMEOUT')).toEqual([]);
+  });
+
   it('emits nothing when CODEGRAPH_VALUE_REFS=0', async () => {
     const prev = process.env.CODEGRAPH_VALUE_REFS;
     process.env.CODEGRAPH_VALUE_REFS = '0';

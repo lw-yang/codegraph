@@ -45,7 +45,7 @@ agent read-reduction (see §4.3).
 
 | Symbol | Role |
 |---|---|
-| `VALUE_REF_LANGS` (static Set) | languages the feature runs for. Currently `typescript`, `javascript`, `tsx`, `go`, `python`, `rust`, `ruby`, `c`, `java`, `csharp`, `php`, `scala`, `kotlin`, `swift`, `dart`. **Add the new language here.** |
+| `VALUE_REF_LANGS` (static Set) | languages the feature runs for. Currently `typescript`, `javascript`, `tsx`, `go`, `python`, `rust`, `ruby`, `c`, `java`, `csharp`, `php`, `scala`, `kotlin`, `swift`, `dart`, `pascal`. **Add the new language here.** |
 | `valueRefsEnabled` | `process.env.CODEGRAPH_VALUE_REFS !== '0'` — default ON, env opts out. |
 | `MAX_VALUE_REF_NODES` (20_000) | per-scope traversal cap (and the shadow-scan cap). |
 | `captureValueRefScope(kind, name, id, node)` | called from `createNode` on every node. Records **targets** (file-scope `const`/`var`) and **reader scopes** (`function`/`method`/`const`/`var`). |
@@ -143,6 +143,15 @@ targets** (see §3).
   The common codegen suffixes (`.g.dart`/`.freezed.dart`/`.pb.dart`) are already filtered by
   `isGeneratedFile`; header-only-marked generators (JNIGEN) are not, so real source is clean but
   generated FFI/JNI bindings are noisy.
+- **Pascal — the genuine easy path + the Dart sibling-body fix again.** Unit/class `const` *already*
+  extracted as `constant` (`variableTypes: ['declConst', …]`), so it was add-to-`VALUE_REF_LANGS` +
+  the shadow prune (`declConst`/`declVar`; a local `const X` shadows a unit `const X`). The catch was
+  the *same* reader-scan bug as Dart: Pascal's proc body is a **`block` sibling** of the `declProc`
+  header (the reader scope), both under a `defProc` — so the same sibling-pull fix was extended to
+  `block`. Reader-scan node type already covered (refs are `identifier`). **Low yield** — Pascal reads
+  constants cross-unit more than same-file (horse: 4 edges). **Caveat:** Pascal is case-insensitive,
+  but the reader-scan matches exact text, so a differently-cased reference is missed (no FP, just a
+  miss); not worth normalizing.
 - **Tests:** `__tests__/value-reference-edges.test.ts` — same-file readers edged; surfaced in
   impact radius; shadowed const NOT edged (verified to fail without the guard); JSX-only read
   edged (tsx); `CODEGRAPH_VALUE_REFS=0` emits nothing.
@@ -173,6 +182,7 @@ the bottom of this section).
 | Kotlin | top-level / `object` / `companion object` `val` (re-kinded from nothing — properties weren't extracted at all). Handled in `visitNode`: nested name (`variable_declaration → simple_identifier`, the C move) + scope-walk for kind (Scala move) + `simple_identifier` in the reader-scan (PHP move) + prune. `class` instance vals stay `field`. Clean — one of the best yields (companion bit-masks) |
 | Swift | top-level `let` + `static let` in `struct`/`enum`/`class`. Reused Kotlin (nested name + `simple_identifier` reader-scan). Two Swift touches: **gate widened to `struct:`/`enum:` parents** (Swift namespaces consts there), and **computed properties skipped**. `class`/instance stored props stay `field`. Slots into the existing Swift property-wrapper handler |
 | Dart | top-level `const`/`final` + class `static const`/`static final` — all the **`static_final_declaration`** node, cleanly separated by the grammar from instance/`var`/local (so no leak guard). `visitNode` → `constant`. Needed a reader-scan fix: Dart's method **body is a next sibling** of the signature, so the scan pulls in a `function_body` sibling. Generated-FFI noise (JNIGEN `_bindings.dart`) is the one caveat |
+| Pascal / Delphi | unit/class `const` (already extracted as `constant`). Add-to-`VALUE_REF_LANGS` + shadow prune (`declConst`/`declVar`) + the **same Dart sibling-body fix** (Pascal's proc body is a `block` sibling of the `declProc` header). Low yield (cross-unit reads); case-insensitive (exact-text scan misses re-cased refs) |
 | **Svelte, Vue, Astro** | **inherited for free** — their extractors re-parse the `<script>`/frontmatter block as `typescript`/`javascript`, which are in `VALUE_REF_LANGS` (verified: a `.svelte` `const` edges its readers). No separate work; no separate matrix row needed. |
 
 **🔜 Remaining — likely the easy path** (constants are file/module-scope, or top-level; do §5: add
@@ -198,7 +208,6 @@ constants extracted as `field` kind, and the fix was emitting the const subset (
 
 | Language | Constant forms |
 |---|---|
-| Pascal / Delphi | `const` sections at unit (file) or class scope (mixed) |
 | Objective-C | `static const` / `extern const` / `#define` (file-ish; macros unparsed; already "partial support") |
 
 **⛔ Attempted & reverted — C++.** file-scope + class `static const`/`constexpr` (mixed). Machinery
@@ -393,6 +402,7 @@ silently does nothing for the new language and intra-file shadowing produces fal
 | Kotlin | `property_declaration` | `variable_declaration → simple_identifier` (and `bump` accepts `simple_identifier`) — catches an object/companion const shadowed by a method-local `val` | **done** |
 | Swift | `property_declaration` | `<name> pattern → simple_identifier` (`firstSimpleIdentifier`) — the prune case resolves both Kotlin and Swift shapes; catches a static const shadowed by a method-local `let` | **done** |
 | Dart | `static_final_declaration` (target) + `initialized_identifier` (field/`var`) + `initialized_variable_definition` (local) | each has a direct `identifier` child — catches a top-level/static const shadowed by a method-local `const` | **done** |
+| Pascal | `declConst` (unit/class const = the target) + `declVar` (a local `var`) | `<name>` field — catches a unit `const X` shadowed by a function-local `const X` | **done** |
 
 **The prune rule is `declarators > file-scope-node-count`, NOT `> 1`.** A name can be bound
 twice *at file scope* legitimately — a **conditional module def** (`try: X = a; except: X = b`,
@@ -504,6 +514,15 @@ fixed); impact delta shows the blind→real radius win; full test suite green.
   (2,956 files) gave only 86 edges vs Ruby rails's 2,255. Don't chase it: cross-file value consumers
   are out of scope for *every* language (would need import/scope resolution). Report the lower yield
   honestly in the matrix rather than treating it as a bug to fix.
+- **Some extractors emit parameters/fields as `variable` at the wrong scope — restrict to `constant`
+  (the Pascal trap).** Pascal's extractor emits function `const`/`var` parameters and class fields as
+  `variable` parented to the enclosing unit/class, so they pass the target gate and collapse to noisy
+  file-wide targets (`Dest`, `aItem` read "everywhere"). The genuine shared values were all `constant`
+  (`declConst`), so the fix is a one-line per-language restriction in `captureValueRefScope`: Pascal
+  targets `constant` only. Before trusting a new language's `variable` targets, sample them — if they're
+  parameters or instance fields rather than module/global state, restrict to `constant`. (A residual
+  tail can still leak: tree-sitter-pascal context-dependently misparses a `const` param in a complex
+  Delphi signature as a `declConst` — a small parse-fidelity FP, accepted as a documented caveat.)
 - **A zero-edge sweep with targets present can be the READER side, not just the reader-scan node type
   (the Dart trap).** Targets extracted fine, reader scopes registered, reader-scan node type correct —
   and still zero edges, because Dart attaches a method **body as a next *sibling*** of the signature

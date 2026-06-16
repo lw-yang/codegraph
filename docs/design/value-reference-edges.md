@@ -1,6 +1,6 @@
 # Design + status: same-file value-reference edges
 
-**Status:** SHIPPED (default-on for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart; `CODEGRAPH_VALUE_REFS=0` disables). The
+**Status:** SHIPPED (default-on for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal; `CODEGRAPH_VALUE_REFS=0` disables). The
 emitter lives in `TreeSitterExtractor.flushValueRefs` (`src/extraction/tree-sitter.ts`).
 **Motivation:** close the impact-analysis hole for *value consumers*. Static
 extraction edges calls, imports, and inheritance, but never edges a constant to the
@@ -13,7 +13,7 @@ readers" class of change (the ReScript-PR false positive that motivated the work
 ## TL;DR for a new session
 
 We emit a `references` edge (`metadata: { valueRef: true }`) from a reader symbol to
-the **file/package-scope `const`/`var` it reads**, same-file only, for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart. Those edges
+the **file/package-scope `const`/`var` it reads**, same-file only, for TS/JS/tsx + Go + Python + Rust + Ruby + C + Java + C# + PHP + Scala + Kotlin + Swift + Dart + Pascal. Those edges
 flow straight into `getImpactRadius` / `codegraph impact` and the impact trail in
 `codegraph_explore` / `codegraph_node` — no agent-behaviour change required.
 
@@ -46,7 +46,7 @@ The win is **impact-radius correctness**, not agent read-reduction (see "Agent A
    the content-minified bundles guard #1 misses.
 3. **Distinctive-name + same-file** as above.
 
-## Validation matrix — TS / JS / Go / Python / Rust / Ruby / C / Java / C# / PHP / Scala / Kotlin / Swift / Dart
+## Validation matrix — TS / JS / Go / Python / Rust / Ruby / C / Java / C# / PHP / Scala / Kotlin / Swift / Dart / Pascal
 
 Method per repo: index the same tree twice (value-refs on vs `CODEGRAPH_VALUE_REFS=0`),
 diff node/edge counts, spot-check precision, and measure `codegraph impact` on a few
@@ -166,7 +166,15 @@ extracting the nodes first — see below)
 | flame-engine/flame | medium | 1,655 | 19,608 (stable) | +465 | all sampled TP; bounded const-vs-getter collisions | `cardWidth` 4→**15**, `tileSize` 3→12 |
 | flutter/packages | large | 3,452 | 116,075 (stable) | +10,015 | real Flutter consts; some `.gen.dart` (pigeon) generated noise | `iconFont` 1→**1790**, `_channel` 6→72, `kMaxId` 1→23 |
 
-Across S/M/L in all fourteen languages: node count never moved, the precision guards held, and
+**Pascal / Delphi** (unit/class `const` → `constant`; **`constant`-only** targets — the extractor emits params/fields as `variable`)
+
+| Repo | size | files | nodes (on=off) | +value-ref edges | precision | `impact` on→off example |
+|---|---|---|---|---|---|---|
+| HashLoad/horse | small | 74 | 2,464 (stable) | +4 (sparse — cross-unit reads) | all sampled TP | `LOG_NFACILITIES` (Syslog const) |
+| synopse/mORMot2 | medium | 539 | 66,760 (stable) | +2,240 | precision sample 100% TP (font/crypto/DB consts); a few `const`-param misparse FPs in complex Delphi sigs | `LIB_CRYPTO` 1→**358**, `DEFAULT_ECCROUNDS` 1→31 |
+| castle-engine | large | 2,430 | 93,692 (stable) | +6,983 | top targets all real FFI binding consts; 0 collisions | `LazGio2_library` 2→**1880**, `LIB_CAIRO` 1→223 |
+
+Across S/M/L in all fifteen languages: node count never moved, the precision guards held, and
 the `impact` OFF column is the bug — a const that 80–140 symbols read reports "1 affected"
 without value-refs.
 
@@ -373,6 +381,27 @@ codegen suffixes (`.g.dart` / `.freezed.dart` / `.pb.dart`) are already skipped 
 but a header-only-marked generator (a JNIGEN `_bindings.dart` with hundreds of `static final _class`)
 isn't suffix-detected, so it collapses to the file-wide target and dominates a small repo's numbers
 (http) — real source stays clean.
+
+**Pascal / Delphi — the easy path plus the Dart sibling-body fix and a `constant`-only restriction.**
+Pascal keeps shared constants in a `const` section at unit (file) or class scope, and those *already*
+extracted as `constant` (`variableTypes: ['declConst', …]`), so wiring was add-to-`VALUE_REF_LANGS` +
+the shadow prune (`declConst`/`declVar` — a function-local `const X` shadows a unit `const X`). It hit
+the **same reader-scan bug as Dart**: Pascal attaches a proc body (`block`) as a *next sibling* of the
+`declProc` header (the reader scope), both under a `defProc`, so the same sibling-pull fix was extended
+to `block`. The Pascal-specific wrinkle is precision: the Pascal extractor emits function **parameters**
+(`const ATarget: TControl`, `var Dest: …`) and class **fields** as `variable` at the enclosing scope,
+which collapse to noisy file-wide targets — so **Pascal value-ref targets are restricted to
+`constant`** (genuine shared values are `const`; the cost is the rare unit-level `var` global). That
+cleaned the bulk (`var`-param/field FPs gone). A residual minority remains — tree-sitter-pascal
+*context-dependently* misparses a `const` parameter in a complex multi-line Delphi method signature as
+a `declConst` (the `ATarget` case; not reproducible in isolation), a parse-fidelity tail like C++ but
+far smaller. After the fix: a random precision sample on mORMot was 100% TP (font/crypto/DB constants
+referencing each other), castle's top targets are all real FFI binding consts with 0 collisions, and
+the headline is FFI library-name constants — `LazGio2_library = 'libgio-2.0…'` read by **1880**
+`external` declarations (2→1880), mORMot's `LIB_CRYPTO` 1→358. **Caveats:** low same-file density on
+app code (cross-unit reads; horse gave 4 edges), the `const`-only restriction, the rare const-param
+misparse, and Pascal's case-insensitivity (the exact-text reader-scan misses a differently-cased
+reference — a miss, never an FP).
 
 **C++ was attempted and reverted** — the machinery (file/namespace-scope + class `field_declaration`
 extraction) is correct on clean C++, but tree-sitter-cpp's parse fidelity on real template/macro-heavy
